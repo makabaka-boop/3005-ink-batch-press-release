@@ -5,22 +5,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func,select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session,joinedload
-from .database import Base,SessionLocal,engine,get_db
+from .database import Base,SessionLocal,engine,get_db,migrate
 from .models import InkBatch,Issue,PressJob
 from .schemas import BatchIn,BatchOut,BatchUpdate,IssueAction,JobIn
 QUALITY_REASON={"pending":("quality_pending","质检状态为待检，未经检验不得上机"),"failed":("quality_failed","质检结果不合格，不得上机"),"quarantined":("quarantined","该批次处于隔离状态，不得上机")}
 def seed(db:Session):
  if db.scalar(select(func.count(InkBatch.id))): return
  today=date.today(); rows=[
-  InkBatch(code="INK-2026-001",color="潘通 186C 红",supplier="华彩油墨",received_date=today-timedelta(days=40),expiry_date=today+timedelta(days=140),viscosity=24.5,quality_status="passed",notes="食品包装用"),
-  InkBatch(code="INK-2026-002",color="深海蓝",supplier="恒印材料",received_date=today-timedelta(days=60),expiry_date=today+timedelta(days=12),viscosity=27.0,quality_status="passed",notes="即将到期"),
-  InkBatch(code="INK-2026-003",color="哑光黑",supplier="华彩油墨",received_date=today-timedelta(days=190),expiry_date=today-timedelta(days=5),viscosity=31.2,quality_status="failed",notes="复检不合格"),
-  InkBatch(code="INK-2026-004",color="暖金",supplier="金点特墨",received_date=today-timedelta(days=8),expiry_date=today+timedelta(days=300),viscosity=22.8,quality_status="quarantined",notes="等待供应商确认")]
- db.add_all(rows);db.flush(); job=PressJob(job_code="JOB-2026-001",batch_id=rows[2].id,press="海德堡 XL75",substrate="250g 白卡纸",planned_date=today,operator="王工",description="包装盒试印");db.add(job);db.flush()
+  InkBatch(code="INK-2026-001",color="潘通 186C 红",supplier="华彩油墨",received_date=today-timedelta(days=40),expiry_date=today+timedelta(days=140),viscosity=24.5,quality_status="passed",notes="食品包装用",received_weight=200,available_weight=200),
+  InkBatch(code="INK-2026-002",color="深海蓝",supplier="恒印材料",received_date=today-timedelta(days=60),expiry_date=today+timedelta(days=12),viscosity=27.0,quality_status="passed",notes="即将到期",received_weight=50,available_weight=50),
+  InkBatch(code="INK-2026-003",color="哑光黑",supplier="华彩油墨",received_date=today-timedelta(days=190),expiry_date=today-timedelta(days=5),viscosity=31.2,quality_status="failed",notes="复检不合格",received_weight=80,available_weight=80),
+  InkBatch(code="INK-2026-004",color="暖金",supplier="金点特墨",received_date=today-timedelta(days=8),expiry_date=today+timedelta(days=300),viscosity=22.8,quality_status="quarantined",notes="等待供应商确认",received_weight=120,available_weight=120)]
+ db.add_all(rows);db.flush(); job=PressJob(job_code="JOB-2026-001",batch_id=rows[2].id,press="海德堡 XL75",substrate="250g 白卡纸",planned_date=today,operator="王工",description="包装盒试印",planned_usage=12);db.add(job);db.flush()
+ rows[2].available_weight-=job.planned_usage
  db.add_all([Issue(job_id=job.id,batch_id=rows[2].id,issue_type="expired",reason="批次已过有效期"),Issue(job_id=job.id,batch_id=rows[2].id,issue_type="quality_failed",reason="质检结果不合格，不得上机")]);db.commit()
 @asynccontextmanager
 async def lifespan(app:FastAPI):
- Base.metadata.create_all(engine)
+ Base.metadata.create_all(engine);migrate()
  with SessionLocal() as db:seed(db)
  yield
 app=FastAPI(title="油墨批次上机放行台 API",lifespan=lifespan)
@@ -37,7 +38,7 @@ def batches(code:str="",color:str="",supplier:str="",quality_status:str="",db:Se
  return db.scalars(q).all()
 @app.post("/api/batches",response_model=BatchOut,status_code=201)
 def create_batch(data:BatchIn,db:Session=Depends(get_db)):
- x=InkBatch(**data.model_dump());db.add(x)
+ x=InkBatch(**data.model_dump(),available_weight=data.received_weight);db.add(x)
  try:db.commit()
  except IntegrityError:db.rollback();raise HTTPException(409,"批次编号已存在")
  db.refresh(x);return x
@@ -57,18 +58,29 @@ def deactivate(item_id:int,db:Session=Depends(get_db)):
 @app.get("/api/jobs")
 def jobs(db:Session=Depends(get_db)):
  rows=db.scalars(select(PressJob).options(joinedload(PressJob.batch)).order_by(PressJob.created_at.desc())).all()
- return [{"id":x.id,"job_code":x.job_code,"batch_id":x.batch_id,"batch_code":x.batch.code,"batch_color":x.batch.color,"press":x.press,"substrate":x.substrate,"planned_date":x.planned_date,"operator":x.operator,"description":x.description,"created_at":x.created_at} for x in rows]
+ return [{"id":x.id,"job_code":x.job_code,"batch_id":x.batch_id,"batch_code":x.batch.code,"batch_color":x.batch.color,"press":x.press,"substrate":x.substrate,"planned_date":x.planned_date,"operator":x.operator,"description":x.description,"planned_usage":x.planned_usage,"status":x.status,"cancelled_at":x.cancelled_at,"created_at":x.created_at} for x in rows]
 @app.post("/api/jobs",status_code=201)
 def create_job(data:JobIn,db:Session=Depends(get_db)):
  batch=db.get(InkBatch,data.batch_id)
  if not batch:raise HTTPException(404,"油墨批次不存在")
  if not batch.active:raise HTTPException(409,"已停用批次不能创建上机记录")
  if db.scalar(select(PressJob).where(PressJob.job_code==data.job_code)):raise HTTPException(409,"工单号已存在")
+ if data.planned_usage>batch.available_weight:raise HTTPException(409,f"可用重量不足：批次剩余 {batch.available_weight} kg，计划用量 {data.planned_usage} kg")
+ batch.available_weight-=data.planned_usage
  job=PressJob(**data.model_dump());db.add(job);db.flush(); issues=[]
  if batch.expiry_date<data.planned_date:issues.append(("expired","计划上机日已超过批次有效期"))
  if batch.quality_status in QUALITY_REASON:issues.append(QUALITY_REASON[batch.quality_status])
  for typ,reason in issues:db.add(Issue(job_id=job.id,batch_id=batch.id,issue_type=typ,reason=reason))
- db.commit();return {"id":job.id,**data.model_dump(),"issues_created":len(issues)}
+ db.commit();return {"id":job.id,**data.model_dump(),"issues_created":len(issues),"available_weight":batch.available_weight}
+@app.patch("/api/jobs/{item_id}/cancel")
+def cancel_job(item_id:int,db:Session=Depends(get_db)):
+ job=db.get(PressJob,item_id)
+ if not job:raise HTTPException(404,"工单不存在")
+ if job.status=="cancelled":raise HTTPException(409,"工单已取消，不能重复取消")
+ job.status="cancelled";job.cancelled_at=datetime.now()
+ batch=db.get(InkBatch,job.batch_id)
+ if batch:batch.available_weight+=job.planned_usage
+ db.commit();return {"id":job.id,"status":"cancelled","returned_weight":job.planned_usage,"available_weight":batch.available_weight if batch else None}
 @app.get("/api/issues")
 def issues(status:str="",db:Session=Depends(get_db)):
  q=select(Issue).options(joinedload(Issue.job),joinedload(Issue.batch)).order_by(Issue.created_at.desc(),Issue.id.desc())

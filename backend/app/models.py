@@ -11,13 +11,16 @@ class InkBatch(Base):
  received_date:Mapped[date]=mapped_column(Date); expiry_date:Mapped[date]=mapped_column(Date,index=True)
  viscosity:Mapped[float]=mapped_column(Float); quality_status:Mapped[str]=mapped_column(String(20),index=True)
  notes:Mapped[str]=mapped_column(Text,default=""); active:Mapped[bool]=mapped_column(Boolean,default=True)
+ received_weight:Mapped[float]=mapped_column(Float,default=0.0); available_weight:Mapped[float]=mapped_column(Float,default=0.0)
  jobs:Mapped[list[PressJob]]=relationship(back_populates="batch")
 class PressJob(Base):
  __tablename__="press_jobs"
  id:Mapped[int]=mapped_column(primary_key=True); job_code:Mapped[str]=mapped_column(String(64),unique=True,index=True)
  batch_id:Mapped[int]=mapped_column(ForeignKey("ink_batches.id")); press:Mapped[str]=mapped_column(String(80)); substrate:Mapped[str]=mapped_column(String(120))
  planned_date:Mapped[date]=mapped_column(Date); operator:Mapped[str]=mapped_column(String(80)); description:Mapped[str]=mapped_column(Text,default="")
- created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.now); batch:Mapped[InkBatch]=relationship(back_populates="jobs")
+ planned_usage:Mapped[float]=mapped_column(Float,default=0.0); status:Mapped[str]=mapped_column(String(20),default="planned",index=True)
+ created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.now); cancelled_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
+ batch:Mapped[InkBatch]=relationship(back_populates="jobs")
 class Issue(Base):
  __tablename__="issues"
  id:Mapped[int]=mapped_column(primary_key=True); job_id:Mapped[int]=mapped_column(ForeignKey("press_jobs.id")); batch_id:Mapped[int]=mapped_column(ForeignKey("ink_batches.id"))
