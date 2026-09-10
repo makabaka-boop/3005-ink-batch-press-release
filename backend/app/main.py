@@ -133,8 +133,8 @@ def switch_job_batch(item_id:int,data:JobSwitch,db:Session=Depends(get_db)):
  r=db.execute(update(PressJob).where(PressJob.id==item_id,PressJob.status=="planned").values(batch_id=target.id,previous_batch_id=prev_id,switched_at=now))
  if r.rowcount!=1:
   db.rollback();raise HTTPException(409,"工单已完成或已取消，不能换料")
- # 沿用创建工单的日期与质检规则，为目标批次补充该工单尚不存在的对应问题；原问题保留为当时检查记录
- existing={x.issue_type for x in db.scalars(select(Issue).where(Issue.job_id==job.id))}
+ # 沿用创建工单的日期与质检规则，为目标批次补充该批次尚不存在的对应问题；相同风险在不同批次各自保留独立检查记录，原问题不改动
+ existing={x.issue_type for x in db.scalars(select(Issue).where(Issue.job_id==job.id,Issue.batch_id==target.id))}
  issues=[]
  if target.expiry_date<job.planned_date:issues.append(("expired","计划上机日已超过批次有效期"))
  if target.quality_status in QUALITY_REASON:issues.append(QUALITY_REASON[target.quality_status])

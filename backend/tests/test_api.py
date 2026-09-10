@@ -197,13 +197,20 @@ def test_switch_generates_target_issues_and_keeps_history(client):
  # 原问题作为当时检查记录保留在原批次上，新问题挂在目标批次
  assert [x['batch_code'] for x in mine if x['issue_type']=='quality_failed']==['S-Q1']
  assert {x['batch_code'] for x in mine if x['issue_type'] in('expired','quarantined')}=={'S-Q2'}
- # 换到同样过期且隔离的批次时，已存在的对应问题不重复补充
+ # 换到另一个同样过期且隔离的批次时，相同风险在新批次上生成独立检查记录
  c=client.post('/api/batches',json=batch('S-Q3',received_weight=30,quality_status='quarantined',received_date=past_r,expiry_date=past_e)).json()['id']
  r=client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':c})
- assert r.status_code==200 and r.json()['issues_created']==0
- assert len([x for x in client.get('/api/issues').json() if x['job_code']=='J-SQ'])==3
+ assert r.status_code==200 and r.json()['issues_created']==2
+ mine=[x for x in client.get('/api/issues').json() if x['job_code']=='J-SQ']
+ assert len(mine)==5
+ assert sorted(x['batch_code'] for x in mine if x['issue_type']=='expired')==['S-Q2','S-Q3']
+ assert sorted(x['batch_code'] for x in mine if x['issue_type']=='quarantined')==['S-Q2','S-Q3']
  j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
  assert j['batch_code']=='S-Q3' and j['previous_batch_code']=='S-Q2'
+ # 换回已检查过的批次时，该批次的对应问题已存在，不重复补充
+ r=client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':b})
+ assert r.status_code==200 and r.json()['issues_created']==0
+ assert len([x for x in client.get('/api/issues').json() if x['job_code']=='J-SQ'])==5
 def test_switch_conflicts_keep_stock_and_ownership(client):
  a=client.post('/api/batches',json=batch('S-6',received_weight=50)).json()['id']
  b=client.post('/api/batches',json=batch('S-7',received_weight=40)).json()['id']
