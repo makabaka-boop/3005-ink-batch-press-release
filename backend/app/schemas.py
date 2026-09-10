@@ -17,6 +17,11 @@ class BatchOut(BatchUpdate): model_config=ConfigDict(from_attributes=True); id:i
 class JobIn(BaseModel):
  job_code:str=Field(min_length=1,max_length=64); batch_id:int; press:str=Field(min_length=1,max_length=80); substrate:str=Field(min_length=1,max_length=120)
  planned_date:date; operator:str=Field(min_length=1,max_length=80); description:str=""; planned_usage:float=Field(default=0,ge=0)
+ @model_validator(mode="after")
+ def usage(self):
+  # 旧请求可不填计划用量（默认 0、不扣减）；但明确填 0 属于无实际用量，拒绝创建
+  if "planned_usage" in self.model_fields_set and self.planned_usage==0: raise ValueError("计划用量必须大于 0")
+  return self
 class IssueAction(BaseModel):
  status:IssueStatus; resolution_note:str=""
  @model_validator(mode="after")

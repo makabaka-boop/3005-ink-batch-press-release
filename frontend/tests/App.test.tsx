@@ -38,3 +38,12 @@ await waitFor(()=>expect(screen.getByText(/可用重量不足：批次剩余 50 
 expect(screen.getByLabelText(/唯一工单号/)).toHaveValue('JOB-T2');expect(screen.getByLabelText(/计划用量/)).toHaveValue(999);
 fireEvent.change(screen.getByLabelText(/计划用量/),{target:{value:'10'}});fireEvent.click(screen.getByText('保存'));
 await waitFor(()=>expect(screen.getByText(/工单已创建/)).toBeInTheDocument())})
+test('decimal weights render at business precision without float tails',async()=>{vi.stubGlobal('fetch',vi.fn((u:string)=>Promise.resolve({ok:true,json:()=>Promise.resolve(
+u.includes('stats')?{batches:1,passed:1,expiring_soon:0,jobs:1,pending_issues:0}:
+u.includes('batches')?[{id:1,code:'INK-F1',color:'品红',supplier:'测试供应商',received_date:'2026-01-01',expiry_date:'2027-01-01',viscosity:20,quality_status:'passed',notes:'',active:true,received_weight:50.3,available_weight:50.199999999999996}]:
+u.includes('jobs')?[{id:1,job_code:'JOB-F1',batch_id:1,batch_code:'INK-F1',batch_color:'品红',press:'海德堡',substrate:'白卡纸',planned_date:'2026-09-10',operator:'王工',description:'',planned_usage:0.1,status:'planned',cancelled_at:null,created_at:'2026-09-10T08:00:00'}]:[])})));
+render(<App/>);await waitFor(()=>expect(screen.getByText('批次总数')).toBeInTheDocument());
+fireEvent.click(screen.getByRole('button',{name:'油墨批次'}));
+await waitFor(()=>expect(dd('可用重量')).toBe('50.2 kg'));expect(dd('入库重量')).toBe('50.3 kg');
+fireEvent.click(screen.getByRole('button',{name:'上机工单'}));
+await waitFor(()=>expect(dd('预占用量')).toBe('0.1 kg'))})

@@ -46,7 +46,10 @@ def create_batch(data:BatchIn,db:Session=Depends(get_db)):
 def update_batch(item_id:int,data:BatchUpdate,db:Session=Depends(get_db)):
  x=db.get(InkBatch,item_id)
  if not x:raise HTTPException(404,"油墨批次不存在")
+ # 入库重量调整时可用重量按差额同步增减，已预占部分不受影响；按业务精度保留 3 位小数
+ delta=round(data.received_weight-x.received_weight,3)
  for k,v in data.model_dump().items():setattr(x,k,v)
+ if delta:x.available_weight=round(x.available_weight+delta,3)
  try:db.commit()
  except IntegrityError:db.rollback();raise HTTPException(409,"批次编号已存在")
  return x
@@ -65,8 +68,8 @@ def create_job(data:JobIn,db:Session=Depends(get_db)):
  if not batch:raise HTTPException(404,"油墨批次不存在")
  if not batch.active:raise HTTPException(409,"已停用批次不能创建上机记录")
  if db.scalar(select(PressJob).where(PressJob.job_code==data.job_code)):raise HTTPException(409,"工单号已存在")
- # 单条 UPDATE 原子完成「校验余额并扣减」，并发预占时只有余额足够的请求能命中
- r=db.execute(update(InkBatch).where(InkBatch.id==batch.id,InkBatch.available_weight>=data.planned_usage).values(available_weight=InkBatch.available_weight-data.planned_usage))
+ # 单条 UPDATE 原子完成「校验余额并扣减」，并发预占时只有余额足够的请求能命中；结果按业务精度保留 3 位小数，避免浮点尾数
+ r=db.execute(update(InkBatch).where(InkBatch.id==batch.id,InkBatch.available_weight>=data.planned_usage).values(available_weight=func.round(InkBatch.available_weight-data.planned_usage,3)))
  if r.rowcount!=1:
   db.rollback();left=db.scalar(select(InkBatch.available_weight).where(InkBatch.id==data.batch_id))
   raise HTTPException(409,f"可用重量不足：批次剩余 {left} kg，计划用量 {data.planned_usage} kg")
@@ -86,7 +89,7 @@ def cancel_job(item_id:int,db:Session=Depends(get_db)):
  # 仅当状态仍为未取消时原子翻转为已取消，并发取消只有一个请求能命中并进入返还逻辑
  r=db.execute(update(PressJob).where(PressJob.id==item_id,PressJob.status!="cancelled").values(status="cancelled",cancelled_at=datetime.now()))
  if r.rowcount!=1:db.rollback();raise HTTPException(409,"工单已取消，不能重复取消")
- db.execute(update(InkBatch).where(InkBatch.id==job.batch_id).values(available_weight=InkBatch.available_weight+job.planned_usage))
+ db.execute(update(InkBatch).where(InkBatch.id==job.batch_id).values(available_weight=func.round(InkBatch.available_weight+job.planned_usage,3)))
  db.commit();left=db.scalar(select(InkBatch.available_weight).where(InkBatch.id==job.batch_id))
  return {"id":job.id,"status":"cancelled","returned_weight":job.planned_usage,"available_weight":left}
 @app.get("/api/issues")

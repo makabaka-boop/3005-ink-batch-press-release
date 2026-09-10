@@ -85,6 +85,30 @@ def test_deactivated_batch_blocked_and_stock_untouched(client):
  client.patch(f'/api/batches/{bid}/deactivate')
  assert client.post('/api/jobs',json={**job('J-W7',bid),'planned_usage':5}).status_code==409
  assert available(client,bid)==25
+def test_update_received_weight_syncs_available_by_delta(client):
+ bid=client.post('/api/batches',json=batch('D-1',received_weight=50)).json()['id']
+ client.post('/api/jobs',json={**job('J-D1',bid),'planned_usage':20});assert available(client,bid)==30
+ r=client.put(f'/api/batches/{bid}',json={**batch('D-1',received_weight=40),'active':True})
+ assert r.status_code==200 and r.json()['received_weight']==40 and r.json()['available_weight']==20
+ assert available(client,bid)==20
+ r=client.put(f'/api/batches/{bid}',json={**batch('D-1',received_weight=65),'active':True})
+ assert r.status_code==200 and r.json()['available_weight']==45 and available(client,bid)==45
+ r=client.put(f'/api/batches/{bid}',json={**batch('D-1',received_weight=65,color='深蓝'),'active':True})
+ assert r.status_code==200 and r.json()['available_weight']==45
+def test_explicit_zero_planned_usage_rejected(client):
+ bid=client.post('/api/batches',json=batch('Z-1',received_weight=10)).json()['id']
+ r=client.post('/api/jobs',json={**job('J-Z1',bid),'planned_usage':0})
+ assert r.status_code==422
+ assert available(client,bid)==10 and not [x for x in client.get('/api/jobs').json() if x['job_code']=='J-Z1']
+ r=client.post('/api/jobs',json=job('J-Z2',bid));assert r.status_code==201 and r.json()['available_weight']==10
+def test_decimal_reservation_rounds_to_business_precision(client):
+ bid=client.post('/api/batches',json=batch('F-1',received_weight=50.3)).json()['id']
+ r=client.post('/api/jobs',json={**job('J-F1',bid),'planned_usage':0.1})
+ assert r.status_code==201 and r.json()['available_weight']==50.2
+ assert available(client,bid)==50.2
+ r=client.patch(f"/api/jobs/{r.json()['id']}/cancel")
+ assert r.status_code==200 and r.json()['available_weight']==50.3
+ assert available(client,bid)==50.3
 def _legacy_db(path):
  conn=sqlite3.connect(path)
  conn.executescript("""CREATE TABLE ink_batches(id INTEGER PRIMARY KEY,code VARCHAR(64),color VARCHAR(80),supplier VARCHAR(120),received_date DATE,expiry_date DATE,viscosity FLOAT,quality_status VARCHAR(20),notes TEXT,active BOOLEAN);
