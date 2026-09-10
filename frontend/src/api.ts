@@ -1,0 +1,1 @@
+export async function api<T>(path:string,options?:RequestInit):Promise<T>{const r=await fetch('/api'+path,{headers:{'Content-Type':'application/json'},...options});if(!r.ok){let m=`请求失败 (${r.status})`;try{m=(await r.json()).detail||m}catch{}throw new Error(typeof m==='string'?m:'数据校验失败')}return r.json()}
