@@ -155,6 +155,76 @@ def test_decimal_reservation_rounds_to_business_precision(client):
  r=client.patch(f"/api/jobs/{r.json()['id']}/cancel")
  assert r.status_code==200 and r.json()['available_weight']==50.3
  assert available(client,bid)==50.3
+def test_switch_batch_moves_reservation_and_ownership_in_one_commit(client):
+ a=client.post('/api/batches',json=batch('S-1',received_weight=50)).json()['id']
+ b=client.post('/api/batches',json=batch('S-2',received_weight=40)).json()['id']
+ jid=client.post('/api/jobs',json={**job('J-S1',a),'planned_usage':20}).json()['id']
+ assert available(client,a)==30 and available(client,b)==40
+ r=client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':b})
+ assert r.status_code==200
+ body=r.json()
+ assert body['batch_id']==b and body['batch_code']=='S-2' and body['previous_batch_id']==a and body['previous_batch_code']=='S-1'
+ assert body['switched_at'] and body['available_weight']==20 and body['issues_created']==0
+ # 一次提交后双边余额与工单归属同时生效
+ assert available(client,a)==50 and available(client,b)==20
+ j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
+ assert j['batch_id']==b and j['batch_code']=='S-2' and j['previous_batch_code']=='S-1' and j['switched_at'] and j['status']=='planned'
+def test_switch_insufficient_balance_rolls_back_atomically(client):
+ a=client.post('/api/batches',json=batch('S-3',received_weight=50)).json()['id']
+ b=client.post('/api/batches',json=batch('S-4',received_weight=10)).json()['id']
+ jid=client.post('/api/jobs',json={**job('J-S2',a),'planned_usage':20}).json()['id']
+ assert available(client,a)==30
+ r=client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':b})
+ assert r.status_code==409 and '可用重量不足' in r.json()['detail']
+ # 原批次返还与目标预占均未生效，工单归属与两边余额保持原值
+ assert available(client,a)==30 and available(client,b)==10
+ j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
+ assert j['batch_id']==a and j['previous_batch_code'] is None and j['switched_at'] is None
+ # 冲突后可改选余额充足的批次再次换料
+ c=client.post('/api/batches',json=batch('S-5',received_weight=60)).json()['id']
+ r=client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':c})
+ assert r.status_code==200 and available(client,a)==50 and available(client,c)==40
+def test_switch_generates_target_issues_and_keeps_history(client):
+ past_r=str(date.today()-timedelta(days=10));past_e=str(date.today()-timedelta(days=1))
+ a=client.post('/api/batches',json=batch('S-Q1',received_weight=50,quality_status='failed')).json()['id']
+ jid=client.post('/api/jobs',json={**job('J-SQ',a),'planned_usage':10}).json()['id']
+ assert {x['issue_type'] for x in client.get('/api/issues').json() if x['job_code']=='J-SQ'}=={'quality_failed'}
+ b=client.post('/api/batches',json=batch('S-Q2',received_weight=30,quality_status='quarantined',received_date=past_r,expiry_date=past_e)).json()['id']
+ r=client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':b})
+ assert r.status_code==200 and r.json()['issues_created']==2
+ mine=[x for x in client.get('/api/issues').json() if x['job_code']=='J-SQ']
+ assert {x['issue_type'] for x in mine}=={'quality_failed','expired','quarantined'}
+ # 原问题作为当时检查记录保留在原批次上，新问题挂在目标批次
+ assert [x['batch_code'] for x in mine if x['issue_type']=='quality_failed']==['S-Q1']
+ assert {x['batch_code'] for x in mine if x['issue_type'] in('expired','quarantined')}=={'S-Q2'}
+ # 换到同样过期且隔离的批次时，已存在的对应问题不重复补充
+ c=client.post('/api/batches',json=batch('S-Q3',received_weight=30,quality_status='quarantined',received_date=past_r,expiry_date=past_e)).json()['id']
+ r=client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':c})
+ assert r.status_code==200 and r.json()['issues_created']==0
+ assert len([x for x in client.get('/api/issues').json() if x['job_code']=='J-SQ'])==3
+ j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
+ assert j['batch_code']=='S-Q3' and j['previous_batch_code']=='S-Q2'
+def test_switch_conflicts_keep_stock_and_ownership(client):
+ a=client.post('/api/batches',json=batch('S-6',received_weight=50)).json()['id']
+ b=client.post('/api/batches',json=batch('S-7',received_weight=40)).json()['id']
+ jid=client.post('/api/jobs',json={**job('J-S3',a),'planned_usage':20}).json()['id']
+ assert client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':a}).status_code==409
+ assert client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':999}).status_code==404
+ assert client.patch('/api/jobs/999/switch',json={'batch_id':b}).status_code==404
+ client.patch(f'/api/batches/{b}/deactivate')
+ r=client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':b})
+ assert r.status_code==409 and '已停用' in r.json()['detail']
+ assert available(client,a)==30 and available(client,b)==40
+ done=client.post('/api/jobs',json={**job('J-S4',a),'planned_usage':5}).json()['id']
+ client.patch(f'/api/jobs/{done}/complete',json={'actual_usage':5})
+ r=client.patch(f'/api/jobs/{done}/switch',json={'batch_id':a})
+ assert r.status_code==409 and '已完成' in r.json()['detail']
+ off=client.post('/api/jobs',json={**job('J-S5',a),'planned_usage':5}).json()['id']
+ client.patch(f'/api/jobs/{off}/cancel')
+ r=client.patch(f'/api/jobs/{off}/switch',json={'batch_id':a})
+ assert r.status_code==409 and '已取消' in r.json()['detail']
+ j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
+ assert j['batch_id']==a and j['previous_batch_code'] is None and available(client,a)==25
 def _legacy_db(path):
  conn=sqlite3.connect(path)
  conn.executescript("""CREATE TABLE ink_batches(id INTEGER PRIMARY KEY,code VARCHAR(64),color VARCHAR(80),supplier VARCHAR(120),received_date DATE,expiry_date DATE,viscosity FLOAT,quality_status VARCHAR(20),notes TEXT,active BOOLEAN);
@@ -169,6 +239,7 @@ def test_migrate_backfills_legacy_rows(tmp_path,monkeypatch):
   assert c.execute(text('SELECT received_weight,available_weight FROM ink_batches WHERE id=1')).one()==(66.0,66.0)
   assert c.execute(text('SELECT planned_usage,status,cancelled_at FROM press_jobs WHERE id=1')).one()==(0.0,'planned',None)
   assert c.execute(text('SELECT actual_usage,completed_at FROM press_jobs WHERE id=1')).one()==(None,None)
+  assert c.execute(text('SELECT previous_batch_id,switched_at FROM press_jobs WHERE id=1')).one()==(None,None)
 def test_migrate_explicit_default_weight(tmp_path,monkeypatch):
  db=tmp_path/'legacy2.db';_legacy_db(db);eng=create_engine(f'sqlite:///{db}')
  monkeypatch.setenv('DEFAULT_RECEIVED_WEIGHT','66');migrate(eng,default_weight=33)

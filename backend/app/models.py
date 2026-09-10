@@ -12,7 +12,7 @@ class InkBatch(Base):
  viscosity:Mapped[float]=mapped_column(Float); quality_status:Mapped[str]=mapped_column(String(20),index=True)
  notes:Mapped[str]=mapped_column(Text,default=""); active:Mapped[bool]=mapped_column(Boolean,default=True)
  received_weight:Mapped[float]=mapped_column(Float,default=0.0); available_weight:Mapped[float]=mapped_column(Float,default=0.0)
- jobs:Mapped[list[PressJob]]=relationship(back_populates="batch")
+ jobs:Mapped[list[PressJob]]=relationship(back_populates="batch",foreign_keys="PressJob.batch_id")
 class PressJob(Base):
  __tablename__="press_jobs"
  id:Mapped[int]=mapped_column(primary_key=True); job_code:Mapped[str]=mapped_column(String(64),unique=True,index=True)
@@ -22,7 +22,10 @@ class PressJob(Base):
  actual_usage:Mapped[Optional[float]]=mapped_column(Float,nullable=True)
  created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.now); cancelled_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
  completed_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
- batch:Mapped[InkBatch]=relationship(back_populates="jobs")
+ previous_batch_id:Mapped[Optional[int]]=mapped_column(ForeignKey("ink_batches.id"),nullable=True)
+ switched_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
+ batch:Mapped[InkBatch]=relationship(back_populates="jobs",foreign_keys=[batch_id])
+ previous_batch:Mapped[Optional[InkBatch]]=relationship(foreign_keys=[previous_batch_id])
 class Issue(Base):
  __tablename__="issues"
  id:Mapped[int]=mapped_column(primary_key=True); job_id:Mapped[int]=mapped_column(ForeignKey("press_jobs.id")); batch_id:Mapped[int]=mapped_column(ForeignKey("ink_batches.id"))

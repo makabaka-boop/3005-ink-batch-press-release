@@ -24,6 +24,8 @@ class JobIn(BaseModel):
   return self
 class JobComplete(BaseModel):
  actual_usage:float=Field(gt=0)
+class JobSwitch(BaseModel):
+ batch_id:int
 class IssueAction(BaseModel):
  status:IssueStatus; resolution_note:str=""
  @model_validator(mode="after")

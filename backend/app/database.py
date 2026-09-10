@@ -43,6 +43,8 @@ def migrate(eng=engine, default_weight: float | None = None):
             if "cancelled_at" not in c: conn.execute(text("ALTER TABLE press_jobs ADD COLUMN cancelled_at DATETIME"))
             if "actual_usage" not in c: conn.execute(text("ALTER TABLE press_jobs ADD COLUMN actual_usage FLOAT"))
             if "completed_at" not in c: conn.execute(text("ALTER TABLE press_jobs ADD COLUMN completed_at DATETIME"))
+            if "previous_batch_id" not in c: conn.execute(text("ALTER TABLE press_jobs ADD COLUMN previous_batch_id INTEGER"))
+            if "switched_at" not in c: conn.execute(text("ALTER TABLE press_jobs ADD COLUMN switched_at DATETIME"))
             conn.execute(text("UPDATE press_jobs SET planned_usage=0 WHERE planned_usage IS NULL"))
             conn.execute(text("UPDATE press_jobs SET status='planned' WHERE status IS NULL"))
             # 历史工单实际用量与完成时间保持 NULL，继续呈现「计划中」的未完成语义，可再次登记完成
