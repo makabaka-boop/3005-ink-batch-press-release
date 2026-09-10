@@ -75,6 +75,52 @@ def test_cancel_returns_weight_only_once(client):
  again=client.patch(f'/api/jobs/{jid}/cancel');assert again.status_code==409 and '重复' in again.json()['detail']
  assert available(client,bid)==40
  assert client.patch('/api/jobs/999/cancel').status_code==404
+def test_complete_underuse_returns_difference(client):
+ bid=client.post('/api/batches',json=batch('K-1',received_weight=50)).json()['id']
+ jid=client.post('/api/jobs',json={**job('J-K1',bid),'planned_usage':20}).json()['id'];assert available(client,bid)==30
+ r=client.patch(f'/api/jobs/{jid}/complete',json={'actual_usage':15})
+ assert r.status_code==200 and r.json()['settled_weight']==5 and r.json()['actual_usage']==15 and r.json()['available_weight']==35
+ assert available(client,bid)==35
+ j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
+ assert j['status']=='completed' and j['actual_usage']==15 and j['settled_weight']==5 and j['completed_at']
+def test_complete_overuse_deducts_difference(client):
+ bid=client.post('/api/batches',json=batch('K-2',received_weight=50)).json()['id']
+ jid=client.post('/api/jobs',json={**job('J-K2',bid),'planned_usage':20}).json()['id'];assert available(client,bid)==30
+ r=client.patch(f'/api/jobs/{jid}/complete',json={'actual_usage':25.5})
+ assert r.status_code==200 and r.json()['settled_weight']==-5.5 and r.json()['available_weight']==24.5
+ assert available(client,bid)==24.5
+ j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
+ assert j['status']=='completed' and j['settled_weight']==-5.5
+def test_complete_exceeding_available_rolls_back_atomically(client):
+ bid=client.post('/api/batches',json=batch('K-3',received_weight=50)).json()['id']
+ jid=client.post('/api/jobs',json={**job('J-K3',bid),'planned_usage':20}).json()['id'];assert available(client,bid)==30
+ r=client.patch(f'/api/jobs/{jid}/complete',json={'actual_usage':60})
+ assert r.status_code==409 and '可用重量不足' in r.json()['detail']
+ assert available(client,bid)==30
+ j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
+ assert j['status']=='planned' and j['actual_usage'] is None and j['completed_at'] is None
+ # 回滚后可凭修正后的实际用量再次完成
+ r=client.patch(f'/api/jobs/{jid}/complete',json={'actual_usage':18});assert r.status_code==200 and available(client,bid)==32
+def test_complete_conflicts_and_cancel_after_complete(client):
+ bid=client.post('/api/batches',json=batch('K-4',received_weight=40)).json()['id']
+ jid=client.post('/api/jobs',json={**job('J-K4',bid),'planned_usage':10}).json()['id']
+ client.patch(f'/api/jobs/{jid}/complete',json={'actual_usage':10})
+ again=client.patch(f'/api/jobs/{jid}/complete',json={'actual_usage':12})
+ assert again.status_code==409 and '已完成' in again.json()['detail'] and available(client,bid)==30
+ off=client.patch(f'/api/jobs/{jid}/cancel');assert off.status_code==409 and '已完成' in off.json()['detail']
+ assert available(client,bid)==30
+ cid=client.post('/api/jobs',json={**job('J-K4C',bid),'planned_usage':5}).json()['id']
+ client.patch(f'/api/jobs/{cid}/cancel')
+ blocked=client.patch(f'/api/jobs/{cid}/complete',json={'actual_usage':5})
+ assert blocked.status_code==409 and '不能完成' in blocked.json()['detail'] and available(client,bid)==30
+ assert client.patch('/api/jobs/999/complete',json={'actual_usage':1}).status_code==404
+ assert client.patch(f'/api/jobs/{jid}/complete',json={'actual_usage':0}).status_code==422
+def test_concurrent_complete_only_first_settles(client):
+ bid=client.post('/api/batches',json=batch('K-5',received_weight=50)).json()['id']
+ jid=client.post('/api/jobs',json={**job('J-K5',bid),'planned_usage':20}).json()['id'];assert available(client,bid)==30
+ codes=_race(lambda c,i:c.patch(f'/api/jobs/{jid}/complete',json={'actual_usage':25}).status_code)
+ assert sorted(codes)==[200,409,409,409,409]
+ assert available(client,bid)==25
 def test_compatible_defaults_without_new_fields(client):
  b=client.post('/api/batches',json=batch('W-6')).json();assert b['received_weight']==100 and b['available_weight']==100
  r=client.post('/api/jobs',json=job('J-W6',b['id']));assert r.status_code==201
@@ -122,6 +168,7 @@ def test_migrate_backfills_legacy_rows(tmp_path,monkeypatch):
  with eng.connect() as c:
   assert c.execute(text('SELECT received_weight,available_weight FROM ink_batches WHERE id=1')).one()==(66.0,66.0)
   assert c.execute(text('SELECT planned_usage,status,cancelled_at FROM press_jobs WHERE id=1')).one()==(0.0,'planned',None)
+  assert c.execute(text('SELECT actual_usage,completed_at FROM press_jobs WHERE id=1')).one()==(None,None)
 def test_migrate_explicit_default_weight(tmp_path,monkeypatch):
  db=tmp_path/'legacy2.db';_legacy_db(db);eng=create_engine(f'sqlite:///{db}')
  monkeypatch.setenv('DEFAULT_RECEIVED_WEIGHT','66');migrate(eng,default_weight=33)

@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session,joinedload
 from .database import Base,SessionLocal,engine,get_db,migrate
 from .models import InkBatch,Issue,PressJob
-from .schemas import BatchIn,BatchOut,BatchUpdate,IssueAction,JobIn
+from .schemas import BatchIn,BatchOut,BatchUpdate,IssueAction,JobComplete,JobIn
 QUALITY_REASON={"pending":("quality_pending","质检状态为待检，未经检验不得上机"),"failed":("quality_failed","质检结果不合格，不得上机"),"quarantined":("quarantined","该批次处于隔离状态，不得上机")}
 def seed(db:Session):
  if db.scalar(select(func.count(InkBatch.id))): return
@@ -61,7 +61,7 @@ def deactivate(item_id:int,db:Session=Depends(get_db)):
 @app.get("/api/jobs")
 def jobs(db:Session=Depends(get_db)):
  rows=db.scalars(select(PressJob).options(joinedload(PressJob.batch)).order_by(PressJob.created_at.desc())).all()
- return [{"id":x.id,"job_code":x.job_code,"batch_id":x.batch_id,"batch_code":x.batch.code,"batch_color":x.batch.color,"press":x.press,"substrate":x.substrate,"planned_date":x.planned_date,"operator":x.operator,"description":x.description,"planned_usage":x.planned_usage,"status":x.status,"cancelled_at":x.cancelled_at,"created_at":x.created_at} for x in rows]
+ return [{"id":x.id,"job_code":x.job_code,"batch_id":x.batch_id,"batch_code":x.batch.code,"batch_color":x.batch.color,"press":x.press,"substrate":x.substrate,"planned_date":x.planned_date,"operator":x.operator,"description":x.description,"planned_usage":x.planned_usage,"actual_usage":x.actual_usage,"settled_weight":round(x.planned_usage-x.actual_usage,3) if x.actual_usage is not None else None,"status":x.status,"cancelled_at":x.cancelled_at,"completed_at":x.completed_at,"created_at":x.created_at} for x in rows]
 @app.post("/api/jobs",status_code=201)
 def create_job(data:JobIn,db:Session=Depends(get_db)):
  batch=db.get(InkBatch,data.batch_id)
@@ -86,12 +86,34 @@ def create_job(data:JobIn,db:Session=Depends(get_db)):
 def cancel_job(item_id:int,db:Session=Depends(get_db)):
  job=db.get(PressJob,item_id)
  if not job:raise HTTPException(404,"工单不存在")
- # 仅当状态仍为未取消时原子翻转为已取消，并发取消只有一个请求能命中并进入返还逻辑
- r=db.execute(update(PressJob).where(PressJob.id==item_id,PressJob.status!="cancelled").values(status="cancelled",cancelled_at=datetime.now()))
- if r.rowcount!=1:db.rollback();raise HTTPException(409,"工单已取消，不能重复取消")
+ # 仅当状态仍为计划中时原子翻转为已取消，已完成工单不得取消；并发取消只有一个请求能命中并进入返还逻辑
+ r=db.execute(update(PressJob).where(PressJob.id==item_id,PressJob.status=="planned").values(status="cancelled",cancelled_at=datetime.now()))
+ if r.rowcount!=1:
+  db.rollback();cur=db.scalar(select(PressJob.status).where(PressJob.id==item_id))
+  raise HTTPException(409,"工单已取消，不能重复取消" if cur=="cancelled" else "工单已完成，不能取消")
  db.execute(update(InkBatch).where(InkBatch.id==job.batch_id).values(available_weight=func.round(InkBatch.available_weight+job.planned_usage,3)))
  db.commit();left=db.scalar(select(InkBatch.available_weight).where(InkBatch.id==job.batch_id))
  return {"id":job.id,"status":"cancelled","returned_weight":job.planned_usage,"available_weight":left}
+@app.patch("/api/jobs/{item_id}/complete")
+def complete_job(item_id:int,data:JobComplete,db:Session=Depends(get_db)):
+ job=db.get(PressJob,item_id)
+ if not job:raise HTTPException(404,"工单不存在")
+ if job.status!="planned":raise HTTPException(409,"工单已完成，不能重复完成" if job.status=="completed" else "工单已取消，不能完成")
+ # 以原计划预占为基准结算：少用返还差额，超用从批次可用重量补扣；超用超出可用重量时余额不足，整笔回滚保持原值
+ delta=round(data.actual_usage-job.planned_usage,3)
+ if delta>0:
+  r=db.execute(update(InkBatch).where(InkBatch.id==job.batch_id,InkBatch.available_weight>=delta).values(available_weight=func.round(InkBatch.available_weight-delta,3)))
+  if r.rowcount!=1:
+   db.rollback();left=db.scalar(select(InkBatch.available_weight).where(InkBatch.id==job.batch_id))
+   raise HTTPException(409,f"批次可用重量不足：超用 {delta} kg，批次剩余 {left} kg，工单与库存均未改动")
+ else:
+  db.execute(update(InkBatch).where(InkBatch.id==job.batch_id).values(available_weight=func.round(InkBatch.available_weight-delta,3)))
+ now=datetime.now()
+ r=db.execute(update(PressJob).where(PressJob.id==item_id,PressJob.status=="planned").values(status="completed",actual_usage=data.actual_usage,completed_at=now))
+ if r.rowcount!=1:
+  db.rollback();raise HTTPException(409,"工单已完成或已取消，不能重复完成")
+ db.commit();left=db.scalar(select(InkBatch.available_weight).where(InkBatch.id==job.batch_id))
+ return {"id":job.id,"status":"completed","actual_usage":data.actual_usage,"settled_weight":round(-delta,3),"available_weight":left,"completed_at":now}
 @app.get("/api/issues")
 def issues(status:str="",db:Session=Depends(get_db)):
  q=select(Issue).options(joinedload(Issue.job),joinedload(Issue.batch)).order_by(Issue.created_at.desc(),Issue.id.desc())

@@ -22,6 +22,8 @@ class JobIn(BaseModel):
   # 旧请求可不填计划用量（默认 0、不扣减）；但明确填 0 属于无实际用量，拒绝创建
   if "planned_usage" in self.model_fields_set and self.planned_usage==0: raise ValueError("计划用量必须大于 0")
   return self
+class JobComplete(BaseModel):
+ actual_usage:float=Field(gt=0)
 class IssueAction(BaseModel):
  status:IssueStatus; resolution_note:str=""
  @model_validator(mode="after")

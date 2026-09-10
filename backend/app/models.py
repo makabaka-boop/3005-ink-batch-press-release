@@ -19,7 +19,9 @@ class PressJob(Base):
  batch_id:Mapped[int]=mapped_column(ForeignKey("ink_batches.id")); press:Mapped[str]=mapped_column(String(80)); substrate:Mapped[str]=mapped_column(String(120))
  planned_date:Mapped[date]=mapped_column(Date); operator:Mapped[str]=mapped_column(String(80)); description:Mapped[str]=mapped_column(Text,default="")
  planned_usage:Mapped[float]=mapped_column(Float,default=0.0); status:Mapped[str]=mapped_column(String(20),default="planned",index=True)
+ actual_usage:Mapped[Optional[float]]=mapped_column(Float,nullable=True)
  created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.now); cancelled_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
+ completed_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
  batch:Mapped[InkBatch]=relationship(back_populates="jobs")
 class Issue(Base):
  __tablename__="issues"
