@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from datetime import date,datetime,timedelta
 from fastapi import Depends,FastAPI,HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func,select
+from sqlalchemy import func,select,update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session,joinedload
 from .database import Base,SessionLocal,engine,get_db,migrate
@@ -65,9 +65,16 @@ def create_job(data:JobIn,db:Session=Depends(get_db)):
  if not batch:raise HTTPException(404,"油墨批次不存在")
  if not batch.active:raise HTTPException(409,"已停用批次不能创建上机记录")
  if db.scalar(select(PressJob).where(PressJob.job_code==data.job_code)):raise HTTPException(409,"工单号已存在")
- if data.planned_usage>batch.available_weight:raise HTTPException(409,f"可用重量不足：批次剩余 {batch.available_weight} kg，计划用量 {data.planned_usage} kg")
- batch.available_weight-=data.planned_usage
- job=PressJob(**data.model_dump());db.add(job);db.flush(); issues=[]
+ # 单条 UPDATE 原子完成「校验余额并扣减」，并发预占时只有余额足够的请求能命中
+ r=db.execute(update(InkBatch).where(InkBatch.id==batch.id,InkBatch.available_weight>=data.planned_usage).values(available_weight=InkBatch.available_weight-data.planned_usage))
+ if r.rowcount!=1:
+  db.rollback();left=db.scalar(select(InkBatch.available_weight).where(InkBatch.id==data.batch_id))
+  raise HTTPException(409,f"可用重量不足：批次剩余 {left} kg，计划用量 {data.planned_usage} kg")
+ db.refresh(batch)
+ job=PressJob(**data.model_dump());db.add(job)
+ try:db.flush()
+ except IntegrityError:db.rollback();raise HTTPException(409,"工单号已存在")
+ issues=[]
  if batch.expiry_date<data.planned_date:issues.append(("expired","计划上机日已超过批次有效期"))
  if batch.quality_status in QUALITY_REASON:issues.append(QUALITY_REASON[batch.quality_status])
  for typ,reason in issues:db.add(Issue(job_id=job.id,batch_id=batch.id,issue_type=typ,reason=reason))
@@ -76,11 +83,12 @@ def create_job(data:JobIn,db:Session=Depends(get_db)):
 def cancel_job(item_id:int,db:Session=Depends(get_db)):
  job=db.get(PressJob,item_id)
  if not job:raise HTTPException(404,"工单不存在")
- if job.status=="cancelled":raise HTTPException(409,"工单已取消，不能重复取消")
- job.status="cancelled";job.cancelled_at=datetime.now()
- batch=db.get(InkBatch,job.batch_id)
- if batch:batch.available_weight+=job.planned_usage
- db.commit();return {"id":job.id,"status":"cancelled","returned_weight":job.planned_usage,"available_weight":batch.available_weight if batch else None}
+ # 仅当状态仍为未取消时原子翻转为已取消，并发取消只有一个请求能命中并进入返还逻辑
+ r=db.execute(update(PressJob).where(PressJob.id==item_id,PressJob.status!="cancelled").values(status="cancelled",cancelled_at=datetime.now()))
+ if r.rowcount!=1:db.rollback();raise HTTPException(409,"工单已取消，不能重复取消")
+ db.execute(update(InkBatch).where(InkBatch.id==job.batch_id).values(available_weight=InkBatch.available_weight+job.planned_usage))
+ db.commit();left=db.scalar(select(InkBatch.available_weight).where(InkBatch.id==job.batch_id))
+ return {"id":job.id,"status":"cancelled","returned_weight":job.planned_usage,"available_weight":left}
 @app.get("/api/issues")
 def issues(status:str="",db:Session=Depends(get_db)):
  q=select(Issue).options(joinedload(Issue.job),joinedload(Issue.batch)).order_by(Issue.created_at.desc(),Issue.id.desc())

@@ -1,11 +1,34 @@
 import sqlite3
+import threading
 from datetime import date,timedelta
 from sqlalchemy import create_engine,text
+from fastapi.testclient import TestClient
 from app.database import migrate
+from app.main import app
 def job(code,batch):return {"job_code":code,"batch_id":batch,"press":"P1","substrate":"纸","planned_date":date.today().isoformat(),"operator":"测试员","description":""}
 def batch(code,**kw):
  p={"code":code,"color":"红","supplier":"供应商","received_date":"2026-01-01","expiry_date":"2027-06-01","viscosity":20,"quality_status":"passed"};p.update(kw);return p
 def available(client,bid):return [x for x in client.get('/api/batches').json() if x['id']==bid][0]['available_weight']
+def _race(fn,n=5):
+ barrier=threading.Barrier(n);out=[]
+ def run(i):
+  c=TestClient(app);barrier.wait();out.append(fn(c,i))
+ ts=[threading.Thread(target=run,args=(i,)) for i in range(n)]
+ for t in ts:t.start()
+ for t in ts:t.join()
+ return out
+def test_concurrent_reservation_only_sufficient_balance_wins(client):
+ bid=client.post('/api/batches',json=batch('C-1',received_weight=50)).json()['id']
+ codes=_race(lambda c,i:c.post('/api/jobs',json={**job(f'C-J{i}',bid),'planned_usage':30}).status_code)
+ assert sorted(codes)==[201,409,409,409,409]
+ assert available(client,bid)==20
+ assert len([x for x in client.get('/api/jobs').json() if x['job_code'].startswith('C-J')])==1
+def test_concurrent_cancel_only_first_returns_weight(client):
+ bid=client.post('/api/batches',json=batch('C-2',received_weight=40)).json()['id']
+ jid=client.post('/api/jobs',json={**job('C-JX',bid),'planned_usage':25}).json()['id'];assert available(client,bid)==15
+ codes=_race(lambda c,i:c.patch(f'/api/jobs/{jid}/cancel').status_code)
+ assert sorted(codes)==[200,409,409,409,409]
+ assert available(client,bid)==40
 def test_seed_health_duplicate_and_validation(client):
  assert client.get('/health').json()=={'status':'ok'};assert len(client.get('/api/batches').json())==4
  p={"code":"INK-2026-001","color":"红","supplier":"供应商","received_date":"2026-01-01","expiry_date":"2027-01-01","viscosity":20,"quality_status":"passed"}

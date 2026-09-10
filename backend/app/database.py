@@ -1,8 +1,15 @@
 import os
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 URL = os.getenv("DATABASE_URL", "sqlite:///./ink.db")
-engine = create_engine(URL, connect_args={"check_same_thread": False} if URL.startswith("sqlite") else {})
+engine = create_engine(URL, connect_args={"check_same_thread": False, "timeout": 15} if URL.startswith("sqlite") else {})
+if URL.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _sqlite_autocommit(dbapi_conn, _):
+        dbapi_conn.isolation_level = None  # 关闭 pysqlite 隐式 BEGIN，交由 begin 事件统一控制
+    @event.listens_for(engine, "begin")
+    def _sqlite_begin_immediate(conn):
+        conn.exec_driver_sql("BEGIN IMMEDIATE")  # 事务开始即取写锁，并发写事务串行化，避免先读后写导致的锁升级死锁
 SessionLocal = sessionmaker(bind=engine, autoflush=False)
 class Base(DeclarativeBase): pass
 def get_db():
