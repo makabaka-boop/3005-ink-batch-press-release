@@ -23,6 +23,8 @@ class PressJob(Base):
  created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.now); cancelled_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
  completed_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
  previous_batch_id:Mapped[Optional[int]]=mapped_column(ForeignKey("ink_batches.id"),nullable=True)
+ # 换料前批次编号在换料时快照保存，后续批次改编号不影响历史换料记录
+ previous_batch_code:Mapped[Optional[str]]=mapped_column(String(64),nullable=True)
  switched_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
  batch:Mapped[InkBatch]=relationship(back_populates="jobs",foreign_keys=[batch_id])
  previous_batch:Mapped[Optional[InkBatch]]=relationship(foreign_keys=[previous_batch_id])

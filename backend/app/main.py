@@ -48,8 +48,11 @@ def update_batch(item_id:int,data:BatchUpdate,db:Session=Depends(get_db)):
  if not x:raise HTTPException(404,"油墨批次不存在")
  # 入库重量调整时可用重量按差额同步增减，已预占部分不受影响；按业务精度保留 3 位小数
  delta=round(data.received_weight-x.received_weight,3)
+ # 已有预占时调低入库重量不得使可用重量变负，否则整笔拒绝，批次保持原值
+ new_available=round(x.available_weight+delta,3)
+ if new_available<0:raise HTTPException(409,f"调整后可用重量不能为负：当前可用 {x.available_weight} kg，入库重量由 {x.received_weight} kg 调为 {data.received_weight} kg 将导致可用重量为 {new_available} kg")
  for k,v in data.model_dump().items():setattr(x,k,v)
- if delta:x.available_weight=round(x.available_weight+delta,3)
+ if delta:x.available_weight=new_available
  try:db.commit()
  except IntegrityError:db.rollback();raise HTTPException(409,"批次编号已存在")
  return x
@@ -61,7 +64,7 @@ def deactivate(item_id:int,db:Session=Depends(get_db)):
 @app.get("/api/jobs")
 def jobs(db:Session=Depends(get_db)):
  rows=db.scalars(select(PressJob).options(joinedload(PressJob.batch),joinedload(PressJob.previous_batch)).order_by(PressJob.created_at.desc())).all()
- return [{"id":x.id,"job_code":x.job_code,"batch_id":x.batch_id,"batch_code":x.batch.code,"batch_color":x.batch.color,"press":x.press,"substrate":x.substrate,"planned_date":x.planned_date,"operator":x.operator,"description":x.description,"planned_usage":x.planned_usage,"actual_usage":x.actual_usage,"settled_weight":round(x.planned_usage-x.actual_usage,3) if x.actual_usage is not None else None,"status":x.status,"cancelled_at":x.cancelled_at,"completed_at":x.completed_at,"created_at":x.created_at,"previous_batch_id":x.previous_batch_id,"previous_batch_code":x.previous_batch.code if x.previous_batch else None,"switched_at":x.switched_at} for x in rows]
+ return [{"id":x.id,"job_code":x.job_code,"batch_id":x.batch_id,"batch_code":x.batch.code,"batch_color":x.batch.color,"press":x.press,"substrate":x.substrate,"planned_date":x.planned_date,"operator":x.operator,"description":x.description,"planned_usage":x.planned_usage,"actual_usage":x.actual_usage,"settled_weight":round(x.planned_usage-x.actual_usage,3) if x.actual_usage is not None else None,"status":x.status,"cancelled_at":x.cancelled_at,"completed_at":x.completed_at,"created_at":x.created_at,"previous_batch_id":x.previous_batch_id,"previous_batch_code":x.previous_batch_code or (x.previous_batch.code if x.previous_batch else None),"switched_at":x.switched_at.astimezone() if x.switched_at else None} for x in rows]
 @app.post("/api/jobs",status_code=201)
 def create_job(data:JobIn,db:Session=Depends(get_db)):
  batch=db.get(InkBatch,data.batch_id)
@@ -130,7 +133,7 @@ def switch_job_batch(item_id:int,data:JobSwitch,db:Session=Depends(get_db)):
   db.rollback();left=db.scalar(select(InkBatch.available_weight).where(InkBatch.id==target.id))
   raise HTTPException(409,f"目标批次可用重量不足：批次剩余 {left} kg，计划用量 {job.planned_usage} kg，工单与库存均未改动")
  now=datetime.now();prev_id,prev_code=job.batch_id,job.batch.code
- r=db.execute(update(PressJob).where(PressJob.id==item_id,PressJob.status=="planned").values(batch_id=target.id,previous_batch_id=prev_id,switched_at=now))
+ r=db.execute(update(PressJob).where(PressJob.id==item_id,PressJob.status=="planned").values(batch_id=target.id,previous_batch_id=prev_id,previous_batch_code=prev_code,switched_at=now))
  if r.rowcount!=1:
   db.rollback();raise HTTPException(409,"工单已完成或已取消，不能换料")
  # 沿用创建工单的日期与质检规则，为目标批次补充该批次尚不存在的对应问题；相同风险在不同批次各自保留独立检查记录，原问题不改动
@@ -142,7 +145,8 @@ def switch_job_batch(item_id:int,data:JobSwitch,db:Session=Depends(get_db)):
  for typ,reason in issues:
   if typ not in existing:db.add(Issue(job_id=job.id,batch_id=target.id,issue_type=typ,reason=reason));created+=1
  db.commit();left=db.scalar(select(InkBatch.available_weight).where(InkBatch.id==target.id))
- return {"id":job.id,"status":"planned","batch_id":target.id,"batch_code":target.code,"previous_batch_id":prev_id,"previous_batch_code":prev_code,"switched_at":now,"issues_created":created,"available_weight":left}
+ # switched_at 按服务端本地时区附带偏移量返回，前端据此换算为操作发生的本地时间，避免标准时区部署下偏差
+ return {"id":job.id,"status":"planned","batch_id":target.id,"batch_code":target.code,"previous_batch_id":prev_id,"previous_batch_code":prev_code,"switched_at":now.astimezone(),"issues_created":created,"available_weight":left}
 @app.get("/api/issues")
 def issues(status:str="",db:Session=Depends(get_db)):
  q=select(Issue).options(joinedload(Issue.job),joinedload(Issue.batch)).order_by(Issue.created_at.desc(),Issue.id.desc())

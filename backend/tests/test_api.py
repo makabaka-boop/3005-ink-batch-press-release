@@ -1,6 +1,6 @@
 import sqlite3
 import threading
-from datetime import date,timedelta
+from datetime import date,datetime,timedelta
 from sqlalchemy import create_engine,text
 from fastapi.testclient import TestClient
 from app.database import migrate
@@ -232,6 +232,63 @@ def test_switch_conflicts_keep_stock_and_ownership(client):
  assert r.status_code==409 and '已取消' in r.json()['detail']
  j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
  assert j['batch_id']==a and j['previous_batch_code'] is None and available(client,a)==25
+def test_update_received_weight_cannot_drive_available_negative(client):
+ bid=client.post('/api/batches',json=batch('N-1',received_weight=50)).json()['id']
+ client.post('/api/jobs',json={**job('J-N1',bid),'planned_usage':40});assert available(client,bid)==10
+ # 已有预占时调低入库重量使可用重量变负：整笔拒绝，批次保持原值
+ r=client.put(f'/api/batches/{bid}',json={**batch('N-1',received_weight=5),'active':True})
+ assert r.status_code==409 and '不能为负' in r.json()['detail']
+ row=[x for x in client.get('/api/batches').json() if x['id']==bid][0]
+ assert row['received_weight']==50 and row['available_weight']==10 and row['color']=='红'
+ # 边界：调到恰好可用为 0 允许，再低 0.001 拒绝
+ r=client.put(f'/api/batches/{bid}',json={**batch('N-1',received_weight=40),'active':True})
+ assert r.status_code==200 and r.json()['available_weight']==0 and available(client,bid)==0
+ r=client.put(f'/api/batches/{bid}',json={**batch('N-1',received_weight=39.999),'active':True})
+ assert r.status_code==409 and available(client,bid)==0
+ # 拒绝后调高入库重量与其他字段修改仍正常按差额同步
+ r=client.put(f'/api/batches/{bid}',json={**batch('N-1',received_weight=60,color='深蓝'),'active':True})
+ assert r.status_code==200 and r.json()['available_weight']==20 and r.json()['color']=='深蓝'
+def test_switch_history_keeps_batch_code_snapshot_after_rename(client):
+ a=client.post('/api/batches',json=batch('H-1',received_weight=50)).json()['id']
+ b=client.post('/api/batches',json=batch('H-2',received_weight=50)).json()['id']
+ jid=client.post('/api/jobs',json={**job('J-H1',a),'planned_usage':10}).json()['id']
+ r=client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':b})
+ assert r.status_code==200 and r.json()['previous_batch_code']=='H-1'
+ # 修改换料前批次编号：历史换料记录保留换料时编号
+ assert client.put(f'/api/batches/{a}',json={**batch('H-1-RENAMED',received_weight=50),'active':True}).status_code==200
+ j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
+ assert j['previous_batch_code']=='H-1' and j['batch_code']=='H-2'
+ # 再次换料按当时编号记录新快照；之后修改上一任批次编号同样不影响历史
+ r=client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':a})
+ assert r.status_code==200 and r.json()['previous_batch_code']=='H-2'
+ client.put(f'/api/batches/{b}',json={**batch('H-2-RENAMED',received_weight=50),'active':True})
+ j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
+ assert j['previous_batch_code']=='H-2' and j['batch_code']=='H-1-RENAMED'
+def test_switch_time_serialized_with_timezone_offset(client):
+ a=client.post('/api/batches',json=batch('T-1',received_weight=50)).json()['id']
+ b=client.post('/api/batches',json=batch('T-2',received_weight=50)).json()['id']
+ jid=client.post('/api/jobs',json={**job('J-T1',a),'planned_usage':10}).json()['id']
+ before=datetime.now().astimezone()
+ r=client.patch(f'/api/jobs/{jid}/switch',json={'batch_id':b})
+ after=datetime.now().astimezone()
+ assert r.status_code==200
+ # 换料时间带时区偏移量返回，前端据此显示操作发生的本地时间（标准时区部署下不再偏差）
+ ts=datetime.fromisoformat(r.json()['switched_at'])
+ assert ts.tzinfo is not None and before<=ts<=after
+ # 刷新后列表中的换料时间仍是同一时刻且带偏移量
+ j=[x for x in client.get('/api/jobs').json() if x['id']==jid][0]
+ ts2=datetime.fromisoformat(j['switched_at'])
+ assert ts2.tzinfo is not None and abs((ts2-ts).total_seconds())<1
+def test_migrate_backfills_previous_batch_code_snapshot(tmp_path):
+ db=tmp_path/'legacy3.db';_legacy_db(db);eng=create_engine(f'sqlite:///{db}')
+ migrate(eng)
+ with eng.begin() as c:c.execute(text("UPDATE press_jobs SET previous_batch_id=1 WHERE id=1"))
+ migrate(eng)
+ with eng.connect() as c:assert c.execute(text('SELECT previous_batch_code FROM press_jobs WHERE id=1')).scalar()=='LEG-1'
+ # 已写入的快照不会被后续迁移或批次改名覆盖
+ with eng.begin() as c:c.execute(text("UPDATE ink_batches SET code='LEG-1-NEW' WHERE id=1"))
+ migrate(eng)
+ with eng.connect() as c:assert c.execute(text('SELECT previous_batch_code FROM press_jobs WHERE id=1')).scalar()=='LEG-1'
 def _legacy_db(path):
  conn=sqlite3.connect(path)
  conn.executescript("""CREATE TABLE ink_batches(id INTEGER PRIMARY KEY,code VARCHAR(64),color VARCHAR(80),supplier VARCHAR(120),received_date DATE,expiry_date DATE,viscosity FLOAT,quality_status VARCHAR(20),notes TEXT,active BOOLEAN);

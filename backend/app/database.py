@@ -44,7 +44,10 @@ def migrate(eng=engine, default_weight: float | None = None):
             if "actual_usage" not in c: conn.execute(text("ALTER TABLE press_jobs ADD COLUMN actual_usage FLOAT"))
             if "completed_at" not in c: conn.execute(text("ALTER TABLE press_jobs ADD COLUMN completed_at DATETIME"))
             if "previous_batch_id" not in c: conn.execute(text("ALTER TABLE press_jobs ADD COLUMN previous_batch_id INTEGER"))
+            if "previous_batch_code" not in c: conn.execute(text("ALTER TABLE press_jobs ADD COLUMN previous_batch_code VARCHAR(64)"))
             if "switched_at" not in c: conn.execute(text("ALTER TABLE press_jobs ADD COLUMN switched_at DATETIME"))
+            # 既有换料记录按当前编号尽力回填快照；新换料在换料时写入快照，之后批次改编号不影响历史记录
+            if "ink_batches" in tables: conn.execute(text("UPDATE press_jobs SET previous_batch_code=(SELECT code FROM ink_batches WHERE ink_batches.id=press_jobs.previous_batch_id) WHERE previous_batch_id IS NOT NULL AND previous_batch_code IS NULL"))
             conn.execute(text("UPDATE press_jobs SET planned_usage=0 WHERE planned_usage IS NULL"))
             conn.execute(text("UPDATE press_jobs SET status='planned' WHERE status IS NULL"))
             # 历史工单实际用量与完成时间保持 NULL，继续呈现「计划中」的未完成语义，可再次登记完成

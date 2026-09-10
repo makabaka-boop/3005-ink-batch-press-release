@@ -131,6 +131,55 @@ app.unmount();render(<App/>);await waitFor(()=>expect(screen.getByText('批次�
 fireEvent.click(screen.getByRole('button',{name:'上机工单'}));
 await waitFor(()=>expect(screen.getByText('INK-S2')).toBeInTheDocument());
 expect(dd('换料前批次')).toBe('INK-S1');expect(dd('换料时间')).not.toBe('')})
+test('successful switch clears stale conflict notice even before refresh settles',async()=>{
+const state={batches:[
+{id:1,code:'INK-S1',color:'品红',supplier:'供应商A',received_date:'2026-01-01',expiry_date:'2027-01-01',viscosity:20,quality_status:'passed',notes:'',active:true,received_weight:50,available_weight:30},
+{id:2,code:'INK-S2',color:'青',supplier:'供应商B',received_date:'2026-01-01',expiry_date:'2027-01-01',viscosity:21,quality_status:'passed',notes:'',active:true,received_weight:40,available_weight:40},
+{id:3,code:'INK-S3',color:'黄',supplier:'供应商C',received_date:'2026-01-01',expiry_date:'2027-01-01',viscosity:22,quality_status:'passed',notes:'',active:true,received_weight:10,available_weight:5}],
+jobs:[{id:1,job_code:'JOB-S1',batch_id:1,batch_code:'INK-S1',batch_color:'品红',press:'海德堡',substrate:'白卡纸',planned_date:'2026-09-10',operator:'王工',description:'',planned_usage:20,actual_usage:null,settled_weight:null,status:'planned',cancelled_at:null,completed_at:null,created_at:'2026-09-10T08:00:00',previous_batch_code:null,switched_at:null}] as any[],
+issues:[] as any[],stats:{batches:3,passed:3,expiring_soon:0,jobs:1,pending_issues:0}};
+const ok=(d:any)=>({ok:true,json:()=>Promise.resolve(d)}),bad=(detail:string)=>({ok:false,status:409,json:()=>Promise.resolve({detail})});
+let slow=false;const pending:Array<()=>void>=[];
+vi.stubGlobal('fetch',vi.fn((u:string,opt?:RequestInit)=>{const m=opt?.method??'GET';
+if(slow&&m==='GET')return new Promise(res=>pending.push(()=>res(ok(u.startsWith('/api/stats')?state.stats:u.startsWith('/api/batches')?state.batches:u.startsWith('/api/issues')?state.issues:state.jobs))));
+if(u.startsWith('/api/batches'))return Promise.resolve(ok(state.batches));
+if(u.startsWith('/api/issues'))return Promise.resolve(ok(state.issues));
+if(u.startsWith('/api/stats'))return Promise.resolve(ok(state.stats));
+if(u==='/api/jobs'&&m==='GET')return Promise.resolve(ok(state.jobs));
+const sw=u.match(/^\/api\/jobs\/(\d+)\/switch$/);if(sw&&m==='PATCH'){const j=state.jobs.find(x=>x.id===Number(sw[1]))!;
+const d=JSON.parse(String(opt?.body));const t=state.batches.find(x=>x.id===d.batch_id)!;
+if(t.available_weight<j.planned_usage)return Promise.resolve(bad(`目标批次可用重量不足：批次剩余 ${t.available_weight} kg，计划用量 ${j.planned_usage} kg，工单与库存均未改动`));
+const prev=state.batches.find(x=>x.id===j.batch_id)!;prev.available_weight+=j.planned_usage;t.available_weight-=j.planned_usage;
+j.previous_batch_code=prev.code;j.batch_id=t.id;j.batch_code=t.code;j.batch_color=t.color;j.switched_at='2026-09-10T11:00:00';
+return Promise.resolve(ok({id:j.id,batch_code:t.code,previous_batch_code:prev.code,switched_at:j.switched_at,issues_created:0,available_weight:t.available_weight}))}
+return Promise.resolve(ok([]))}));
+render(<App/>);await waitFor(()=>expect(screen.getByText('批次总数')).toBeInTheDocument());
+fireEvent.click(screen.getByRole('button',{name:'上机工单'}));await waitFor(()=>expect(screen.getByText('JOB-S1')).toBeInTheDocument());
+// 换料余额冲突：出现冲突提示
+fireEvent.change(screen.getByLabelText(/换料批次/),{target:{value:'3'}});
+fireEvent.click(screen.getByRole('button',{name:'确认换料'}));
+await waitFor(()=>expect(screen.getByText(/目标批次可用重量不足/)).toBeInTheDocument());
+// 改选充足批次换料成功：成功提示出现时旧冲突提示已被清除（刷新尚未完成也不并存）
+slow=true;
+fireEvent.change(screen.getByLabelText(/换料批次/),{target:{value:'2'}});
+fireEvent.click(screen.getByRole('button',{name:'确认换料'}));
+await waitFor(()=>expect(screen.getByText(/已换料至 INK-S2/)).toBeInTheDocument());
+expect(screen.queryByText(/目标批次可用重量不足/)).not.toBeInTheDocument();
+pending.splice(0).forEach(r=>r());
+await waitFor(()=>expect(screen.queryByText('正在加载生产数据…')).not.toBeInTheDocument());
+expect(screen.queryByText(/目标批次可用重量不足/)).not.toBeInTheDocument()})
+test('switch time renders as local time of the offset-aware server instant',async()=>{
+const iso='2026-09-10T02:00:00+00:00';
+vi.stubGlobal('fetch',vi.fn((u:string)=>Promise.resolve({ok:true,json:()=>Promise.resolve(
+u.includes('stats')?{batches:1,passed:1,expiring_soon:0,jobs:1,pending_issues:0}:
+u.includes('batches')?[{id:1,code:'INK-TZ1',color:'品红',supplier:'测试供应商',received_date:'2026-01-01',expiry_date:'2027-01-01',viscosity:20,quality_status:'passed',notes:'',active:true,received_weight:50,available_weight:45}]:
+u.includes('jobs')?[{id:1,job_code:'JOB-TZ1',batch_id:1,batch_code:'INK-TZ1',batch_color:'品红',press:'海德堡',substrate:'白卡纸',planned_date:'2026-09-10',operator:'王工',description:'',planned_usage:5,actual_usage:null,settled_weight:null,status:'planned',cancelled_at:null,completed_at:null,created_at:'2026-09-10T08:00:00',previous_batch_code:'INK-TZ0',switched_at:iso}]:[])})));
+render(<App/>);await waitFor(()=>expect(screen.getByText('批次总数')).toBeInTheDocument());
+fireEvent.click(screen.getByRole('button',{name:'上机工单'}));
+await waitFor(()=>expect(screen.getByText('JOB-TZ1')).toBeInTheDocument());
+// 服务端标准时区时刻按本地时间显示，不直接展示原始偏移前钟点
+expect(dd('换料时间')).toBe(new Date(iso).toLocaleString('zh-CN'));
+expect(dd('换料前批次')).toBe('INK-TZ0')})
 test('decimal weights render at business precision without float tails',async()=>{vi.stubGlobal('fetch',vi.fn((u:string)=>Promise.resolve({ok:true,json:()=>Promise.resolve(
 u.includes('stats')?{batches:1,passed:1,expiring_soon:0,jobs:1,pending_issues:0}:
 u.includes('batches')?[{id:1,code:'INK-F1',color:'品红',supplier:'测试供应商',received_date:'2026-01-01',expiry_date:'2027-01-01',viscosity:20,quality_status:'passed',notes:'',active:true,received_weight:50.3,available_weight:50.199999999999996}]:
