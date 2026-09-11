@@ -51,3 +51,11 @@ def migrate(eng=engine, default_weight: float | None = None):
             conn.execute(text("UPDATE press_jobs SET planned_usage=0 WHERE planned_usage IS NULL"))
             conn.execute(text("UPDATE press_jobs SET status='planned' WHERE status IS NULL"))
             # 历史工单实际用量与完成时间保持 NULL，继续呈现「计划中」的未完成语义，可再次登记完成
+        if "issues" in tables:
+            # 巡检问题不关联工单：旧库 issues.job_id 为 NOT NULL，重建表放宽为可空，既有问题数据原样保留
+            info = conn.execute(text("PRAGMA table_info(issues)")).all()
+            if any(r[1] == "job_id" and r[3] for r in info):
+                conn.execute(text("CREATE TABLE issues_nullable_job(id INTEGER PRIMARY KEY, job_id INTEGER REFERENCES press_jobs(id), batch_id INTEGER, issue_type VARCHAR(40), created_at DATETIME, reason TEXT, status VARCHAR(20), resolution_note TEXT)"))
+                conn.execute(text("INSERT INTO issues_nullable_job SELECT id, job_id, batch_id, issue_type, created_at, reason, status, resolution_note FROM issues"))
+                conn.execute(text("DROP TABLE issues"))
+                conn.execute(text("ALTER TABLE issues_nullable_job RENAME TO issues"))

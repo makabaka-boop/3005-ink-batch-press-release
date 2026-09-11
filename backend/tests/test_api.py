@@ -29,6 +29,102 @@ def test_concurrent_cancel_only_first_returns_weight(client):
  codes=_race(lambda c,i:c.patch(f'/api/jobs/{jid}/cancel').status_code)
  assert sorted(codes)==[200,409,409,409,409]
  assert available(client,bid)==40
+def insp(**kw):
+ p={"measured_at":"2026-09-11T08:00:00","viscosity":20,"operator":"王工","notes":""};p.update(kw);return p
+def drift_issues(client,code):return [x for x in client.get('/api/issues').json() if x['issue_type']=='viscosity_drift' and x['batch_code']==code]
+def test_inspection_normal_readings_no_alert(client):
+ bid=client.post('/api/batches',json=batch('V-1',viscosity=20)).json()['id']
+ r=client.post(f'/api/batches/{bid}/inspections',json=insp(viscosity=21,notes='开机前复测'))
+ assert r.status_code==201 and r.json()['issue_created'] is False and r.json()['operator']=='王工'
+ # +9.5% 未超过 10%，不告警
+ r=client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T09:00:00',viscosity=21.9))
+ assert r.status_code==201 and r.json()['issue_created'] is False
+ assert drift_issues(client,'V-1')==[]
+ hist=client.get(f'/api/batches/{bid}/inspections').json()
+ assert [x['viscosity'] for x in hist]==[21,21.9] and hist[0]['notes']=='开机前复测'
+ assert client.get('/api/batches/999/inspections').status_code==404
+ assert client.post('/api/batches/999/inspections',json=insp()).status_code==404
+ assert client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T10:00:00',viscosity=0)).status_code==422
+def test_inspection_out_of_order_conflict_not_persisted(client):
+ bid=client.post('/api/batches',json=batch('V-2',viscosity=20)).json()['id']
+ assert client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T09:00:00',viscosity=25,operator='甲')).status_code==201
+ # 早于该批次最新测量时间的补录返回 409 且不落库
+ r=client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T08:00:00',viscosity=30,operator='乙'))
+ assert r.status_code==409 and '早于' in r.json()['detail']
+ hist=client.get(f'/api/batches/{bid}/inspections').json()
+ assert len(hist)==1 and hist[0]['viscosity']==25 and hist[0]['operator']=='甲'
+ # 与最新测量时间相同的登记允许，历史按测量时间与记录编号稳定排序
+ assert client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T09:00:00',viscosity=21,operator='丙')).status_code==201
+ hist=client.get(f'/api/batches/{bid}/inspections').json()
+ assert [x['operator'] for x in hist]==['甲','丙']
+ # 被拒绝的 30 未入库，25 与 21 不同向超限，未触发漂移判定
+ assert drift_issues(client,'V-2')==[]
+def test_inspection_drift_alert_single_open_issue(client):
+ bid=client.post('/api/batches',json=batch('V-3',viscosity=20)).json()['id']
+ assert client.post(f'/api/batches/{bid}/inspections',json=insp(viscosity=25)).status_code==201
+ r=client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T09:00:00',viscosity=26))
+ assert r.status_code==201 and r.json()['issue_created'] is True
+ drift=drift_issues(client,'V-3')
+ assert len(drift)==1 and drift[0]['source']=='inspection' and drift[0]['job_code'] is None and drift[0]['status']=='pending'
+ assert '10%' in drift[0]['reason']
+ # 未关闭问题存在时继续漂移不重复开单
+ r=client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T10:00:00',viscosity=27))
+ assert r.json()['issue_created'] is False and len(drift_issues(client,'V-3'))==1
+ # 问题关闭后再次连续漂移可开新单
+ assert client.patch(f"/api/issues/{drift[0]['id']}",json={"status":"closed","resolution_note":"已停机调整"}).status_code==200
+ r=client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T11:00:00',viscosity=28))
+ assert r.json()['issue_created'] is True and len(drift_issues(client,'V-3'))==2
+def test_inspection_downward_and_mixed_direction(client):
+ bid=client.post('/api/batches',json=batch('V-4',viscosity=20)).json()['id']
+ # 反向（向下）连续超限同样告警
+ assert client.post(f'/api/batches/{bid}/inspections',json=insp(viscosity=17)).status_code==201
+ r=client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T09:00:00',viscosity=16))
+ assert r.json()['issue_created'] is True and len(drift_issues(client,'V-4'))==1
+ # 一上一下不属于同向偏离，不告警
+ bid2=client.post('/api/batches',json=batch('V-5',viscosity=20)).json()['id']
+ assert client.post(f'/api/batches/{bid2}/inspections',json=insp(viscosity=25)).status_code==201
+ r=client.post(f'/api/batches/{bid2}/inspections',json=insp(measured_at='2026-09-11T09:00:00',viscosity=16))
+ assert r.json()['issue_created'] is False and drift_issues(client,'V-5')==[]
+def test_inspection_exact_boundary_ten_percent_no_alert(client):
+ bid=client.post('/api/batches',json=batch('V-6',viscosity=20)).json()['id']
+ # 恰好偏离 10% 不算「超过」，不告警
+ assert client.post(f'/api/batches/{bid}/inspections',json=insp(viscosity=22)).status_code==201
+ r=client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T09:00:00',viscosity=22))
+ assert r.json()['issue_created'] is False and drift_issues(client,'V-6')==[]
+ # 最新两条为 22.5 与 22 时，22 未超过 10%，仍不告警；再登记 23 后最新两条均超限才告警
+ r=client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T10:00:00',viscosity=22.5))
+ assert r.json()['issue_created'] is False and drift_issues(client,'V-6')==[]
+ r=client.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T11:00:00',viscosity=23))
+ assert r.json()['issue_created'] is True and len(drift_issues(client,'V-6'))==1
+def test_concurrent_inspection_single_open_drift_issue(client):
+ bid=client.post('/api/batches',json=batch('V-7',viscosity=20)).json()['id']
+ assert client.post(f'/api/batches/{bid}/inspections',json=insp(viscosity=25)).status_code==201
+ # 并发登记同一测量时间的异常读数：串行化写事务下全部成功，但同批次只生成一条未关闭漂移问题
+ codes=_race(lambda c,i:c.post(f'/api/batches/{bid}/inspections',json=insp(measured_at='2026-09-11T09:00:00',viscosity=26,operator=f'op{i}')).status_code)
+ assert sorted(codes)==[201,201,201,201,201]
+ drift=drift_issues(client,'V-7')
+ assert len(drift)==1 and drift[0]['source']=='inspection' and drift[0]['job_code'] is None
+ assert len(client.get(f'/api/batches/{bid}/inspections').json())==6
+def _legacy_db_with_issues(path):
+ conn=sqlite3.connect(path)
+ conn.executescript("""CREATE TABLE ink_batches(id INTEGER PRIMARY KEY,code VARCHAR(64),color VARCHAR(80),supplier VARCHAR(120),received_date DATE,expiry_date DATE,viscosity FLOAT,quality_status VARCHAR(20),notes TEXT,active BOOLEAN);
+ CREATE TABLE press_jobs(id INTEGER PRIMARY KEY,job_code VARCHAR(64),batch_id INTEGER,press VARCHAR(80),substrate VARCHAR(120),planned_date DATE,operator VARCHAR(80),description TEXT,created_at DATETIME);
+ CREATE TABLE issues(id INTEGER PRIMARY KEY,job_id INTEGER NOT NULL,batch_id INTEGER,issue_type VARCHAR(40),created_at DATETIME,reason TEXT,status VARCHAR(20),resolution_note TEXT);
+ INSERT INTO ink_batches VALUES(1,'LEG-1','红','供应商','2026-01-01','2027-01-01',20,'passed','',1);
+ INSERT INTO press_jobs VALUES(1,'LEG-J1',1,'P1','纸','2026-02-01','op','','2026-01-01 00:00:00');
+ INSERT INTO issues VALUES(1,1,1,'expired','2026-01-01 00:00:00','批次已过有效期','pending','待确认');""")
+ conn.commit();conn.close()
+def test_migrate_issues_job_id_nullable(tmp_path):
+ db=tmp_path/'legacy_issues.db';_legacy_db_with_issues(db);eng=create_engine(f'sqlite:///{db}')
+ migrate(eng)
+ # 旧库 issues.job_id 的 NOT NULL 被放宽，可插入不关联工单的巡检问题，既有问题数据原样保留
+ with eng.begin() as c:c.execute(text("INSERT INTO issues(job_id,batch_id,issue_type,created_at,reason,status,resolution_note) VALUES(NULL,1,'viscosity_drift','2026-01-02 00:00:00','巡检漂移','pending','')"))
+ with eng.connect() as c:
+  rows=c.execute(text('SELECT job_id,issue_type,reason,resolution_note FROM issues ORDER BY id')).all()
+ assert rows[0]==(1,'expired','批次已过有效期','待确认')
+ assert rows[1]==(None,'viscosity_drift','巡检漂移','')
+ migrate(eng)  # 重复迁移幂等
+ with eng.connect() as c:assert c.execute(text('SELECT COUNT(*) FROM issues')).scalar()==2
 def test_seed_health_duplicate_and_validation(client):
  assert client.get('/health').json()=={'status':'ok'};assert len(client.get('/api/batches').json())==4
  p={"code":"INK-2026-001","color":"红","supplier":"供应商","received_date":"2026-01-01","expiry_date":"2027-01-01","viscosity":20,"quality_status":"passed"}

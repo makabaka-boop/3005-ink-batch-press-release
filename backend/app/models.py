@@ -13,6 +13,7 @@ class InkBatch(Base):
  notes:Mapped[str]=mapped_column(Text,default=""); active:Mapped[bool]=mapped_column(Boolean,default=True)
  received_weight:Mapped[float]=mapped_column(Float,default=0.0); available_weight:Mapped[float]=mapped_column(Float,default=0.0)
  jobs:Mapped[list[PressJob]]=relationship(back_populates="batch",foreign_keys="PressJob.batch_id")
+ inspections:Mapped[list[ViscosityInspection]]=relationship(back_populates="batch")
 class PressJob(Base):
  __tablename__="press_jobs"
  id:Mapped[int]=mapped_column(primary_key=True); job_code:Mapped[str]=mapped_column(String(64),unique=True,index=True)
@@ -30,7 +31,15 @@ class PressJob(Base):
  previous_batch:Mapped[Optional[InkBatch]]=relationship(foreign_keys=[previous_batch_id])
 class Issue(Base):
  __tablename__="issues"
- id:Mapped[int]=mapped_column(primary_key=True); job_id:Mapped[int]=mapped_column(ForeignKey("press_jobs.id")); batch_id:Mapped[int]=mapped_column(ForeignKey("ink_batches.id"))
+ # 巡检产生的黏度漂移问题不依赖工单，job_id 可空；旧库的 NOT NULL 约束由 migrate 重建表放宽
+ id:Mapped[int]=mapped_column(primary_key=True); job_id:Mapped[Optional[int]]=mapped_column(ForeignKey("press_jobs.id"),nullable=True); batch_id:Mapped[int]=mapped_column(ForeignKey("ink_batches.id"))
  issue_type:Mapped[str]=mapped_column(String(40)); created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.now); reason:Mapped[str]=mapped_column(Text)
  status:Mapped[str]=mapped_column(String(20),default="pending"); resolution_note:Mapped[str]=mapped_column(Text,default="")
- job:Mapped[PressJob]=relationship(); batch:Mapped[InkBatch]=relationship()
+ job:Mapped[Optional[PressJob]]=relationship(); batch:Mapped[InkBatch]=relationship()
+class ViscosityInspection(Base):
+ __tablename__="viscosity_inspections"
+ id:Mapped[int]=mapped_column(primary_key=True); batch_id:Mapped[int]=mapped_column(ForeignKey("ink_batches.id"),index=True)
+ measured_at:Mapped[datetime]=mapped_column(DateTime); viscosity:Mapped[float]=mapped_column(Float)
+ operator:Mapped[str]=mapped_column(String(80)); notes:Mapped[str]=mapped_column(Text,default="")
+ created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.now)
+ batch:Mapped[InkBatch]=relationship(back_populates="inspections")

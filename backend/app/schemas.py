@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date,datetime
 from typing import Literal
 from pydantic import BaseModel,ConfigDict,Field,model_validator
 from .database import default_received_weight
@@ -32,3 +32,5 @@ class IssueAction(BaseModel):
  def approval_reason(self):
   if self.status=="approved" and not self.resolution_note.strip(): raise ValueError("特批放行必须填写理由")
   return self
+class InspectionIn(BaseModel):
+ measured_at:datetime; viscosity:float=Field(gt=0); operator:str=Field(min_length=1,max_length=80); notes:str=""

@@ -6,9 +6,10 @@ from sqlalchemy import func,select,update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session,joinedload
 from .database import Base,SessionLocal,engine,get_db,migrate
-from .models import InkBatch,Issue,PressJob
-from .schemas import BatchIn,BatchOut,BatchUpdate,IssueAction,JobComplete,JobIn,JobSwitch
+from .models import InkBatch,Issue,PressJob,ViscosityInspection
+from .schemas import BatchIn,BatchOut,BatchUpdate,InspectionIn,IssueAction,JobComplete,JobIn,JobSwitch
 QUALITY_REASON={"pending":("quality_pending","质检状态为待检，未经检验不得上机"),"failed":("quality_failed","质检结果不合格，不得上机"),"quarantined":("quarantined","该批次处于隔离状态，不得上机")}
+DRIFT_TOLERANCE=0.1  # 黏度漂移告警阈值：相对建档黏度同向偏离「超过」10%（恰好 10% 不告警，1e-9 为浮点余量）
 def seed(db:Session):
  if db.scalar(select(func.count(InkBatch.id))): return
  today=date.today(); rows=[
@@ -61,6 +62,30 @@ def deactivate(item_id:int,db:Session=Depends(get_db)):
  x=db.get(InkBatch,item_id)
  if not x:raise HTTPException(404,"油墨批次不存在")
  x.active=False;db.commit();return {"id":x.id,"active":False}
+def _inspection_out(r:ViscosityInspection):return {"id":r.id,"batch_id":r.batch_id,"measured_at":r.measured_at,"viscosity":r.viscosity,"operator":r.operator,"notes":r.notes,"created_at":r.created_at}
+@app.get("/api/batches/{item_id}/inspections")
+def inspections(item_id:int,db:Session=Depends(get_db)):
+ if not db.get(InkBatch,item_id):raise HTTPException(404,"油墨批次不存在")
+ # 按测量时间与记录编号稳定排序，并发登记后历史与趋势的顺序仍然确定
+ rows=db.scalars(select(ViscosityInspection).where(ViscosityInspection.batch_id==item_id).order_by(ViscosityInspection.measured_at,ViscosityInspection.id)).all()
+ return [_inspection_out(r) for r in rows]
+@app.post("/api/batches/{item_id}/inspections",status_code=201)
+def create_inspection(item_id:int,data:InspectionIn,db:Session=Depends(get_db)):
+ batch=db.get(InkBatch,item_id)
+ if not batch:raise HTTPException(404,"油墨批次不存在")
+ # 写事务（BEGIN IMMEDIATE）内校验并拒绝早于该批次最新测量时间的补录；并发登记串行化，不会漏判或重复判定
+ latest=db.scalar(select(func.max(ViscosityInspection.measured_at)).where(ViscosityInspection.batch_id==item_id))
+ if latest is not None and data.measured_at<latest:raise HTTPException(409,f"测量时间 {data.measured_at} 早于该批次最新巡检时间 {latest}，补录被拒绝")
+ rec=ViscosityInspection(batch_id=item_id,**data.model_dump());db.add(rec);db.flush()
+ # 以批次建档黏度为基准检查最新连续两条记录：均向同一方向偏离超过 10% 时，原子创建该批次至多一条未关闭的黏度漂移问题
+ last2=db.scalars(select(ViscosityInspection).where(ViscosityInspection.batch_id==item_id).order_by(ViscosityInspection.measured_at.desc(),ViscosityInspection.id.desc()).limit(2)).all()
+ issue_created=False
+ if len(last2)==2:
+  devs=[(r.viscosity-batch.viscosity)/batch.viscosity for r in last2]
+  if all(d>DRIFT_TOLERANCE+1e-9 for d in devs) or all(d<-(DRIFT_TOLERANCE+1e-9) for d in devs):
+   if not db.scalar(select(Issue.id).where(Issue.batch_id==item_id,Issue.issue_type=="viscosity_drift",Issue.status!="closed")):
+    db.add(Issue(job_id=None,batch_id=item_id,issue_type="viscosity_drift",reason=f"连续两次现场巡检黏度（{last2[1].viscosity:g} → {last2[0].viscosity:g}）较建档黏度 {batch.viscosity:g} 同向偏离超过 10%"));issue_created=True
+ db.commit();return {**_inspection_out(rec),"issue_created":issue_created}
 @app.get("/api/jobs")
 def jobs(db:Session=Depends(get_db)):
  rows=db.scalars(select(PressJob).options(joinedload(PressJob.batch),joinedload(PressJob.previous_batch)).order_by(PressJob.created_at.desc())).all()
@@ -151,7 +176,8 @@ def switch_job_batch(item_id:int,data:JobSwitch,db:Session=Depends(get_db)):
 def issues(status:str="",db:Session=Depends(get_db)):
  q=select(Issue).options(joinedload(Issue.job),joinedload(Issue.batch)).order_by(Issue.created_at.desc(),Issue.id.desc())
  if status:q=q.where(Issue.status==status)
- return [{"id":x.id,"job_code":x.job.job_code,"batch_code":x.batch.code,"batch_color":x.batch.color,"issue_type":x.issue_type,"created_at":x.created_at,"reason":x.reason,"status":x.status,"resolution_note":x.resolution_note} for x in db.scalars(q).all()]
+ # 问题来源：job_id 为空为批次巡检问题（不关联工单），否则为工单风险问题，仍展示原工单编号
+ return [{"id":x.id,"source":"inspection" if x.job_id is None else "job","job_code":x.job.job_code if x.job else None,"batch_code":x.batch.code,"batch_color":x.batch.color,"issue_type":x.issue_type,"created_at":x.created_at,"reason":x.reason,"status":x.status,"resolution_note":x.resolution_note} for x in db.scalars(q).all()]
 @app.patch("/api/issues/{item_id}")
 def action(item_id:int,data:IssueAction,db:Session=Depends(get_db)):
  x=db.get(Issue,item_id)

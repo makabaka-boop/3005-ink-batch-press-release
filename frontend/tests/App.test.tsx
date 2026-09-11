@@ -180,6 +180,57 @@ await waitFor(()=>expect(screen.getByText('JOB-TZ1')).toBeInTheDocument());
 // 服务端标准时区时刻按本地时间显示，不直接展示原始偏移前钟点
 expect(dd('换料时间')).toBe(new Date(iso).toLocaleString('zh-CN'));
 expect(dd('换料前批次')).toBe('INK-TZ0')})
+test('viscosity inspection: two abnormal readings raise drift issue shown in trend and issues after refresh',async()=>{
+const state={batches:[{id:1,code:'INK-V1',color:'品红',supplier:'测试供应商',received_date:'2026-01-01',expiry_date:'2027-01-01',viscosity:20,quality_status:'passed',notes:'',active:true,received_weight:50,available_weight:50}],
+jobs:[] as any[],issues:[] as any[],inspections:[] as any[],stats:{batches:1,passed:1,expiring_soon:0,jobs:0,pending_issues:0}};
+const ok=(d:any)=>({ok:true,json:()=>Promise.resolve(d)});
+vi.stubGlobal('fetch',vi.fn((u:string,opt?:RequestInit)=>{const m=opt?.method??'GET';
+const insp=u.match(/^\/api\/batches\/(\d+)\/inspections$/);
+if(insp&&m==='GET')return Promise.resolve(ok([...state.inspections].sort((a,b)=>a.measured_at.localeCompare(b.measured_at)||a.id-b.id)));
+if(insp&&m==='POST'){const d=JSON.parse(String(opt?.body));const rec={id:state.inspections.length+1,batch_id:Number(insp[1]),notes:'',created_at:'2026-09-11T10:00:00',...d};state.inspections.push(rec);
+const s=[...state.inspections].sort((a,b)=>a.measured_at.localeCompare(b.measured_at)||a.id-b.id),last2=s.slice(-2);let created=false;
+if(last2.length===2){const dev=last2.map(r=>(r.viscosity-20)/20);
+if((dev.every(x=>x>0.1+1e-9)||dev.every(x=>x<-(0.1+1e-9)))&&!state.issues.some(x=>x.issue_type==='viscosity_drift'&&x.status!=='closed')){created=true;state.stats.pending_issues++;
+state.issues.push({id:state.issues.length+1,source:'inspection',job_code:null,batch_code:'INK-V1',batch_color:'品红',issue_type:'viscosity_drift',created_at:'2026-09-11T10:05:00',reason:'连续两次现场巡检黏度（25 → 26）较建档黏度 20 同向偏离超过 10%',status:'pending',resolution_note:''})}}
+return Promise.resolve(ok({...rec,issue_created:created}))}
+if(u.startsWith('/api/batches'))return Promise.resolve(ok(state.batches));
+if(u.startsWith('/api/issues'))return Promise.resolve(ok(state.issues));
+if(u.startsWith('/api/stats'))return Promise.resolve(ok(state.stats));
+if(u==='/api/jobs')return Promise.resolve(ok(state.jobs));
+return Promise.resolve(ok([]))}));
+const app=render(<App/>);await waitFor(()=>expect(screen.getByText('批次总数')).toBeInTheDocument());
+fireEvent.click(screen.getByRole('button',{name:'油墨批次'}));
+await waitFor(()=>expect(screen.getByText('INK-V1')).toBeInTheDocument());
+fireEvent.click(screen.getByRole('button',{name:'黏度巡检'}));
+await waitFor(()=>expect(screen.getByText('暂无巡检记录')).toBeInTheDocument());
+// 第一次异常读数：仅一条记录，不告警
+fireEvent.change(screen.getByLabelText(/测量时间/),{target:{value:'2026-09-11T08:00'}});
+fireEvent.change(screen.getByLabelText(/实测黏度/),{target:{value:'25'}});
+fireEvent.change(screen.getByLabelText(/巡检人员/),{target:{value:'王工'}});
+fireEvent.click(screen.getByRole('button',{name:'登记巡检'}));
+await waitFor(()=>expect(screen.getByText('巡检已登记 ×')).toBeInTheDocument());
+await waitFor(()=>expect(screen.getByText(/\+25\.0%/)).toBeInTheDocument());
+// 第二次同向异常读数：触发黏度漂移问题
+fireEvent.change(screen.getByLabelText(/测量时间/),{target:{value:'2026-09-11T09:00'}});
+fireEvent.change(screen.getByLabelText(/实测黏度/),{target:{value:'26'}});
+fireEvent.click(screen.getByRole('button',{name:'登记巡检'}));
+await waitFor(()=>expect(screen.getByText(/已生成黏度漂移问题/)).toBeInTheDocument());
+expect(screen.getByLabelText('黏度趋势')).toBeInTheDocument();
+expect(screen.getByText(/\+30\.0%/)).toBeInTheDocument();expect(screen.getAllByText('王工').length).toBe(2);
+// 问题处置中可见批次巡检标识的漂移问题
+fireEvent.click(screen.getByRole('button',{name:/问题处置/}));
+await waitFor(()=>expect(screen.getByText('黏度漂移')).toBeInTheDocument());
+expect(screen.getByText(/批次巡检 · INK-V1/)).toBeInTheDocument();expect(screen.getByText(/连续两次现场巡检黏度/)).toBeInTheDocument();
+// 刷新后趋势与问题仍在
+app.unmount();render(<App/>);await waitFor(()=>expect(screen.getByText('批次总数')).toBeInTheDocument());
+fireEvent.click(screen.getByRole('button',{name:/问题处置/}));
+await waitFor(()=>expect(screen.getByText('黏度漂移')).toBeInTheDocument());
+expect(screen.getByText(/批次巡检 · INK-V1/)).toBeInTheDocument();
+fireEvent.click(screen.getByRole('button',{name:'油墨批次'}));
+await waitFor(()=>expect(screen.getByText('INK-V1')).toBeInTheDocument());
+fireEvent.click(screen.getByRole('button',{name:'黏度巡检'}));
+await waitFor(()=>expect(screen.getByText(/\+30\.0%/)).toBeInTheDocument());
+expect(screen.getByLabelText('黏度趋势')).toBeInTheDocument();expect(screen.getByText(/\+25\.0%/)).toBeInTheDocument()})
 test('decimal weights render at business precision without float tails',async()=>{vi.stubGlobal('fetch',vi.fn((u:string)=>Promise.resolve({ok:true,json:()=>Promise.resolve(
 u.includes('stats')?{batches:1,passed:1,expiring_soon:0,jobs:1,pending_issues:0}:
 u.includes('batches')?[{id:1,code:'INK-F1',color:'品红',supplier:'测试供应商',received_date:'2026-01-01',expiry_date:'2027-01-01',viscosity:20,quality_status:'passed',notes:'',active:true,received_weight:50.3,available_weight:50.199999999999996}]:
